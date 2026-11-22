@@ -1,0 +1,43 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Compiled binaries
+*.so
+*.dll
+*.o
+*.a
+*.pyd
+
+# Build files
+build/
+dist/
+*.egg-info/
+CMakeFiles/
+CMakeCache.txt
+
+# Datasets
+data/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Virtual environments
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
