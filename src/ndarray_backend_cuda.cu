@@ -1005,13 +1005,19 @@ void FlashAttentionBackward_Baseline(const CudaArray& q, const CudaArray& k, con
   cudaDeviceSynchronize();
 }
 
+template <int FBR, int FBC, int FTHREADS>
 __global__ void FlashAttentionForwardKernel_MatMul(
     const scalar_t* q, const scalar_t* k, const scalar_t* v,
     scalar_t* out, scalar_t* lse,
     size_t B, size_t H, size_t N, size_t D, bool causal) {
 
+  constexpr int FNUM_WARPS = FTHREADS / WARP_SIZE;
+  static_assert(FTHREADS % WARP_SIZE == 0);
+  static_assert(FBR % FNUM_WARPS == 0);
+  static_assert(FBR >= FNUM_WARPS * 4);
+  static_assert(FBC % 8 == 0);
   // Number of queries assigned to each warp
-  constexpr int ROWS_PER_WARP = BR / NUM_WARPS;
+  constexpr int ROWS_PER_WARP = FBR / FNUM_WARPS;
 
   // Divide each warp into sections for threads to process
   constexpr int LANES_PER_ROW = 8;
@@ -1019,7 +1025,7 @@ __global__ void FlashAttentionForwardKernel_MatMul(
   constexpr int ROWS_PER_THREAD =
       (ROWS_PER_WARP + LANES_PER_COL - 1) / LANES_PER_COL;
   constexpr int COLS_PER_THREAD =
-      (BC + LANES_PER_ROW - 1) / LANES_PER_ROW;
+      (FBC + LANES_PER_ROW - 1) / LANES_PER_ROW;
   
   // Number of output feature columns assigned to each thread
   constexpr int FEATURES_PER_THREAD =
@@ -1035,9 +1041,9 @@ __global__ void FlashAttentionForwardKernel_MatMul(
   // Offset of the current batch/head in Q/K/V
   const size_t base = BatchHeadIdx * N * D;
   /// Number of K/V tiles
-  const size_t Tc = (N + BC - 1) / BC;
+  const size_t Tc = (N + FBC - 1) / FBC;
   // First query for this tile
-  const size_t q_start = tileIdx * BR;
+  const size_t q_start = tileIdx * FBR;
 
   // Map lanes to row and column positions
   const int row_group = lane_id / LANES_PER_ROW;
@@ -1048,9 +1054,9 @@ __global__ void FlashAttentionForwardKernel_MatMul(
   const int col_base = col_group * COLS_PER_THREAD;
 
   // Shared-memory tiles for Q, transposed K, and V
-  __shared__ scalar_t Q_shared[BR][D_CONST];
-  __shared__ scalar_t K_shared[D_CONST][BC];
-  __shared__ scalar_t V_shared[BC][D_CONST];
+  __shared__ scalar_t Q_shared[FBR][D_CONST];
+  __shared__ scalar_t K_shared[D_CONST][FBC];
+  __shared__ scalar_t V_shared[FBC][D_CONST];
 
   // Per-thread running softmax maximum and denominator
   float m[ROWS_PER_THREAD];
@@ -1064,8 +1070,8 @@ __global__ void FlashAttentionForwardKernel_MatMul(
 
   // Load Q into shared memory
   for (size_t idx = tid;
-       idx < (size_t)BR * D_CONST;
-       idx += NUM_THREADS) {
+       idx < (size_t)FBR * D_CONST;
+       idx += FTHREADS) {
 
     const int r = idx / D_CONST;
     const int d = idx % D_CONST;
@@ -1091,18 +1097,18 @@ __global__ void FlashAttentionForwardKernel_MatMul(
   }
 
   // Number of elements in one K tile
-  constexpr int ELEMENTS_PER_TILE = BC * D_CONST;
+  constexpr int ELEMENTS_PER_TILE = FBC * D_CONST;
 
   // Number of cooperative loading iterations per thread
   constexpr int LOAD_ITERATIONS =
-      (ELEMENTS_PER_TILE + NUM_THREADS - 1) / NUM_THREADS;
+      (ELEMENTS_PER_TILE + FTHREADS - 1) / FTHREADS;
 
   // Scale attention scores by 1/sqrt(D)
   const float scale = rsqrtf((float)D);
 
   // Number of K/V tiles to attend to under causal attention
   const size_t causal_tile_limit =
-      (q_start + BR + BC - 1) / BC;
+      (q_start + FBR + FBC - 1) / FBC;
   size_t tiles_to_process;
   if (causal && causal_tile_limit < Tc) {
       tiles_to_process = causal_tile_limit;
@@ -1110,19 +1116,19 @@ __global__ void FlashAttentionForwardKernel_MatMul(
       tiles_to_process = Tc;
   }
 
-  // Mask including all 32 lanes for warp shuffle operations
+  // Mask including all 32 lanes for warp shuffle
   constexpr unsigned FULL_MASK = 0xffffffffu;
 
   // Load K transpose and V tiles into shared memory
   for (size_t Ti = 0; Ti < tiles_to_process; Ti++) {
     for (size_t i = 0; i < LOAD_ITERATIONS; i++) {
-      const size_t idx = tid + NUM_THREADS * i;
+      const size_t idx = tid + FTHREADS * i;
 
       if (idx < ELEMENTS_PER_TILE) {
         const int row = idx / D_CONST;
         const int col = idx % D_CONST;
 
-        const size_t key_row = Ti * BC + row;
+        const size_t key_row = Ti * FBC + row;
 
         if (key_row < N && col < D) {
           K_shared[col][row] =
@@ -1169,10 +1175,10 @@ __global__ void FlashAttentionForwardKernel_MatMul(
 
       for (int j = 0; j < COLS_PER_THREAD; j++) {
         const int c = col_base + j;
-        const size_t key_row = Ti * BC + c;
+        const size_t key_row = Ti * FBC + c;
 
-        bool valid = q_local < BR && query_row < N &&
-          c < BC && key_row < N;
+        bool valid = q_local < FBR && query_row < N &&
+          c < FBC && key_row < N;
         if (causal) {
           valid = valid && (key_row <= query_row);
         }
@@ -1250,7 +1256,7 @@ __global__ void FlashAttentionForwardKernel_MatMul(
           const int q_local = warp_id * ROWS_PER_WARP + row_base + i;
           const size_t query_row = q_start + q_local;
 
-          if (q_local >= BR || query_row >= N)
+          if (q_local >= FBR || query_row >= N)
             continue;
 
           // Accumulate weighted V values for this thread's output features
@@ -1271,7 +1277,7 @@ __global__ void FlashAttentionForwardKernel_MatMul(
     const int q_local = warp_id * ROWS_PER_WARP + row_base + i;
     const size_t query_row = q_start + q_local;
 
-    if (q_local >= BR || query_row >= N) {
+    if (q_local >= FBR || query_row >= N) {
       continue;
     }
 
@@ -1299,17 +1305,47 @@ __global__ void FlashAttentionForwardKernel_MatMul(
   }
 }
 
-void FlashAttentionForward_MatMul(
+
+template <int FBR, int FBC, int FTHREADS>
+void LaunchFlashAttentionForward(
     const CudaArray& q, const CudaArray& k, const CudaArray& v,
     CudaArray* out, CudaArray* lse,
     uint32_t B, uint32_t H, uint32_t N, uint32_t D, bool causal) {
 
-  dim3 grid((N + BR - 1) / BR, B * H);
-  dim3 block(NUM_THREADS);
+  dim3 grid((N + FBR - 1) / FBR, B * H);
+  dim3 block(FTHREADS);
 
-  FlashAttentionForwardKernel_MatMul<<<grid, block>>>(
-      q.ptr, k.ptr, v.ptr, out->ptr, lse->ptr,
-      B, H, N, D, causal);
+  FlashAttentionForwardKernel_MatMul<FBR, FBC, FTHREADS>
+      <<<grid, block>>>(
+          q.ptr, k.ptr, v.ptr, out->ptr, lse->ptr,
+          B, H, N, D, causal);
+}
+
+void FlashAttentionForward_MatMul(
+    const CudaArray& q, const CudaArray& k, const CudaArray& v,
+    CudaArray* out, CudaArray* lse,
+    uint32_t B, uint32_t H, uint32_t N, uint32_t D, bool causal,
+    int br, int bc, int num_threads) {
+
+  // Supported precompiled configurations.
+  #define FORWARD_CASE(R, C, T) \
+    if (br == R && bc == C && num_threads == T) { \
+      LaunchFlashAttentionForward<R, C, T>( \
+          q, k, v, out, lse, B, H, N, D, causal); \
+      return; \
+    }
+
+  FORWARD_CASE(16, 32, 128)
+  FORWARD_CASE(32, 32, 128)
+  FORWARD_CASE(32, 32, 256)
+  FORWARD_CASE(32, 64, 128)
+  FORWARD_CASE(64, 32, 128)
+  FORWARD_CASE(64, 32, 256)
+
+  #undef FORWARD_CASE
+
+  throw std::runtime_error(
+      "Unsupported forward configuration (br, bc, num_threads)");
 }
 
 template <int BR, int BC, int TM, int TN, int NUM_THREADS, bool USE_FMA>
@@ -1643,8 +1679,7 @@ void LaunchFlashAttentionBackward_MatMul(
 
   dim3 grid((N + BC - 1) / BC, B * H);
   FlashAttentionBackwardKernel_MatMul<
-      BR, BC, TM, TN, THREADS, USE_FMA
-  ><<<grid, THREADS>>>(
+      BR, BC, TM, TN, THREADS, USE_FMA><<<grid, THREADS>>>(
       q.ptr, k.ptr, v.ptr, o.ptr, lse.ptr,
       dO.ptr, dq->ptr, dk->ptr, dv->ptr,
       delta.ptr, B, H, N, D, causal);
@@ -1663,7 +1698,6 @@ void FlashAttentionBackward_MatMul(
     throw std::runtime_error("FA2 tiled backward requires D=64");
   }
 
-  // Delta remains on the original configuration.
   dim3 delta_grid((N + BC - 1) / BC, B * H);
   dim3 delta_block(NUM_THREADS);
   CudaArray delta((size_t)B * H * N);
@@ -1674,17 +1708,17 @@ void FlashAttentionBackward_MatMul(
   cudaMemset(dq->ptr, 0,
              (size_t)B * H * N * D_CONST * sizeof(scalar_t));
 
-  #define LAUNCH(R, C, M, T, THREADS)                          \
-    if (use_fma) {                                             \
-      LaunchFlashAttentionBackward_MatMul<                     \
-          R, C, M, T, THREADS, true>(                          \
-          q, k, v, o, lse, dO, dq, dk, dv, delta,              \
-          B, H, N, D, causal);                                 \
-    } else {                                                   \
-      LaunchFlashAttentionBackward_MatMul<                     \
-          R, C, M, T, THREADS, false>(                         \
-          q, k, v, o, lse, dO, dq, dk, dv, delta,              \
-          B, H, N, D, causal);                                 \
+  #define LAUNCH(R, C, M, T, THREADS) \
+    if (use_fma) { \
+      LaunchFlashAttentionBackward_MatMul< \
+          R, C, M, T, THREADS, true>( \
+          q, k, v, o, lse, dO, dq, dk, dv, delta, \
+          B, H, N, D, causal); \
+    } else { \
+      LaunchFlashAttentionBackward_MatMul< \
+          R, C, M, T, THREADS, false>( \
+          q, k, v, o, lse, dO, dq, dk, dv, delta, \
+          B, H, N, D, causal); \
     }
 
   if (br == 32 && bc == 32 && tm == 4 && tn == 4 && num_threads == 128) {
@@ -1781,8 +1815,16 @@ PYBIND11_MODULE(ndarray_backend_cuda, m) {
 
 
   // Optimized implementations
-  m.def("flash_attention_forward",
-        FlashAttentionForward_MatMul);
+  m.def(
+      "flash_attention_forward",
+      FlashAttentionForward_MatMul,
+      py::arg("q"), py::arg("k"), py::arg("v"),
+      py::arg("out"), py::arg("lse"),
+      py::arg("B"), py::arg("H"), py::arg("N"), py::arg("D"),
+      py::arg("causal"),
+      py::arg("br") = 32,
+      py::arg("bc") = 32,
+      py::arg("num_threads") = 128);
   m.def(
       "flash_attention_backward",
       FlashAttentionBackward_MatMul,
