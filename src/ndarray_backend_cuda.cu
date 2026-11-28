@@ -633,376 +633,36 @@ void ReduceSum(const CudaArray& a, CudaArray* out, size_t reduce_size) {
 }
 
 
-constexpr int BR = 32;
-constexpr int BC = 32;
-constexpr int D_CONST = 64; // support generic size D in future
-constexpr int NUM_THREADS = 128;
+constexpr int D_CONST = 64;
 constexpr int WARP_SIZE = 32;
-constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
 
-
-__global__ void FlashAttentionForwardKernal(const scalar_t* q, const scalar_t* k, const scalar_t* v, 
-                                            scalar_t* out, scalar_t* lse, 
-                                            size_t B, size_t H, size_t N, size_t D, bool causal) {
-  constexpr int ROWS_PER_WARP = BR / NUM_WARPS;
-  constexpr int FEATURES_PER_ROW = (D_CONST + WARP_SIZE - 1) / WARP_SIZE;
-  constexpr int FEATURES_PER_THREAD = ROWS_PER_WARP * FEATURES_PER_ROW;
-  size_t tileIdx = blockIdx.x;
-  size_t BatchHeadIdx = blockIdx.y;
-  size_t BatchIdx = BatchHeadIdx / H;
-  size_t HeadIdx = BatchHeadIdx % H;
-  size_t tid = threadIdx.x;
-  size_t warp_id = tid / WARP_SIZE;
-  size_t lane_id = tid % WARP_SIZE;
-  size_t base = BatchHeadIdx * N * D_CONST;
-  size_t Tr = (N + BR - 1) / BR;
-  size_t Tc = (N + BC - 1) / BC;
-  size_t q_start = tileIdx * BR;
-
-  __shared__ scalar_t K_shared[BC][D_CONST];
-  __shared__ scalar_t V_shared[BC][D_CONST];
-  
-  float q_reg[ROWS_PER_WARP][FEATURES_PER_ROW];
-  float m[ROWS_PER_WARP];
-  float l[ROWS_PER_WARP];
-  float acc[ROWS_PER_WARP][FEATURES_PER_ROW];
-
-  for (int r = 0; r < ROWS_PER_WARP; r++) {
-    size_t query_row = q_start + warp_id * ROWS_PER_WARP + r;
-
-    for (int f = 0; f < FEATURES_PER_ROW; f++) {
-        int feature = lane_id + f * WARP_SIZE;
-
-        if (query_row < N && feature < D_CONST) {
-            q_reg[r][f] = q[base + query_row * D_CONST + feature];
-        } else {
-            q_reg[r][f] = 0.0f;
-        }
-    }
-  }
-
-  for (int r = 0; r < ROWS_PER_WARP; r++) {
-    m[r] = -INFINITY;
-    l[r] = 0.0f;
-
-    for (int f = 0; f < FEATURES_PER_ROW; f++) {
-        acc[r][f] = 0.0f;
-    }
-  }
-
-
-
-  constexpr int ELEMENTS_PER_TILE = BC * D_CONST;
-  constexpr int LOAD_ITERATIONS = (ELEMENTS_PER_TILE + NUM_THREADS - 1) / NUM_THREADS;
-
-  const float scale = rsqrtf((float)D_CONST);
-
-  for (size_t Ti = 0; Ti < Tc; Ti++) {
-
-    // Init the tilied K, V matrices
-    size_t iterations = (D_CONST * BC + NUM_THREADS - 1) / NUM_THREADS;
-    for (size_t i = 0; i < iterations; i += 1) {
-      size_t idx = tid + NUM_THREADS * i;
-      
-      if (idx < D_CONST * BC) {
-        size_t row = idx / D_CONST;
-        size_t col = idx % D_CONST;
-        size_t key_row = Ti * BC + row;
-
-        if (key_row < N) {
-          K_shared[row][col] = k[base + key_row * D_CONST + col];
-          V_shared[row][col] = v[base + key_row * D_CONST + col];
-        } else {
-          K_shared[row][col] = 0.0f;
-          V_shared[row][col] = 0.0f;
-        }
-      }
-    }
-    __syncthreads();
-
-    
-    // Compute attention scores and online softmax
-    for (int r = 0; r < ROWS_PER_WARP; r++) {
-      size_t query_row = q_start + warp_id * ROWS_PER_WARP + r;
-
-      if (query_row >= N) continue;
-
-      for (int j = 0; j < BC; j++) {
-        size_t key_row = Ti * BC + j;
-
-        if (key_row >= N) continue;
-        if (causal && key_row > query_row) continue;
-
-        float partial = 0.0f;
-
-        for (int f = 0; f < FEATURES_PER_ROW; f++) {
-          int feature = lane_id + f * WARP_SIZE;
-
-          if (feature < D_CONST) {
-            partial += q_reg[r][f] * K_shared[j][feature];
-          }
-        }
-
-        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-          partial += __shfl_down_sync(0xffffffff, partial, offset);
-        }
-
-        float score = __shfl_sync(0xffffffff, partial, 0) * scale;
-
-        float new_m = fmaxf(m[r], score);
-        float alpha = expf(m[r] - new_m);
-        float beta = expf(score - new_m);
-
-        l[r] = alpha * l[r] + beta;
-        
-        for (int f = 0; f < FEATURES_PER_ROW; f++) {
-          int feature = lane_id + f * WARP_SIZE;
-
-          if (feature < D_CONST) {
-              acc[r][f] = alpha * acc[r][f] + beta * V_shared[j][feature];
-          }
-        }
-
-        m[r] = new_m;
-      }
-    }
-    __syncthreads();
-  }
-
-  for (size_t r = 0; r < ROWS_PER_WARP; r++) {
-    size_t query_row = q_start + warp_id * ROWS_PER_WARP + r;
-
-    if (query_row >= N) continue;
-
-    for (size_t f = 0; f < FEATURES_PER_ROW; f++) {
-      int feature = lane_id + f * WARP_SIZE;
-      if (feature < D_CONST) {
-        out[base + query_row * D_CONST + feature] = acc[r][f] / l[r];
-      }
-    }
-
-    if (lane_id == 0) lse[BatchHeadIdx * N + query_row] = m[r] + logf(l[r]);
-  }
-
-
-  
-}
-
-void FlashAttentionForward_Baseline(const CudaArray& q, const CudaArray& k, const CudaArray& v, CudaArray* out,
-                           CudaArray* lse, uint32_t B, uint32_t H, uint32_t N, uint32_t D, bool causal) {
-  dim3 grid((N + BR - 1) / BR, B * H);
-  dim3 block(NUM_THREADS);
-
-  FlashAttentionForwardKernal<<<grid, block>>>(q.ptr, k.ptr, v.ptr, out->ptr, lse->ptr,
-                                               B, H, N, D, causal);
-}
+constexpr int DELTA_THREADS = 128;
+constexpr int DELTA_WARPS = DELTA_THREADS / WARP_SIZE;
 
 __global__ void InitDeltaMatrixKernel(const scalar_t* dO, const scalar_t* O, scalar_t* Dout,
-                                  size_t B, size_t H, size_t N, size_t D) {
-  constexpr int ROWS_PER_WARP = BC / NUM_WARPS;
-  constexpr int FEATURES_PER_ROW = (D_CONST + WARP_SIZE - 1) / WARP_SIZE;
-  constexpr int FEATURES_PER_THREAD = ROWS_PER_WARP * FEATURES_PER_ROW;
-  size_t tileIdx = blockIdx.x;
-  size_t BatchHeadIdx = blockIdx.y;
-  size_t BatchIdx = BatchHeadIdx / H;
-  size_t HeadIdx = BatchHeadIdx % H;
-  size_t tid = threadIdx.x;
-  size_t warp_id = tid / WARP_SIZE;
-  size_t lane_id = tid % WARP_SIZE;
-  size_t base = BatchHeadIdx * N * D_CONST;
-  size_t d_start = tileIdx * BC;
-                                    
-  for (size_t r = 0; r < ROWS_PER_WARP; r++) {
-    size_t d_row = d_start + warp_id * ROWS_PER_WARP + r;
+                                      size_t B, size_t H, size_t N, size_t D) {
+  const size_t batch_head = blockIdx.y;
+  const size_t warp_id = threadIdx.x / WARP_SIZE;
+  const int lane_id = threadIdx.x % WARP_SIZE;
 
-    if (d_row >= N) continue;
-    float sum = 0.0f;
+  const size_t row = blockIdx.x * DELTA_WARPS + warp_id;
 
-    for (size_t f = 0; f < FEATURES_PER_ROW; f++) {
-      size_t d_feature = f * WARP_SIZE + lane_id;
+  if (row >= N) return;
 
-      if (d_feature < D_CONST) {
-        size_t idx = base + d_row * D_CONST + d_feature;
-        sum += O[idx] * dO[idx];
-      }
-    }
+  const size_t base = (batch_head * N + row) * D;
+  float sum = 0.0f;
 
-    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-      sum += __shfl_down_sync(0xffffffff, sum, offset);
-    }
-
-    if (lane_id == 0) Dout[BatchHeadIdx * N + d_row] = sum;
-  }
-}
-
-__global__ void FlashAttentionBackwardKernal(const scalar_t* q, const scalar_t* k, const scalar_t* v, const scalar_t* o,
-                                             const scalar_t* lse, const scalar_t* dO, scalar_t* dq, scalar_t* dk, scalar_t* dv,
-                                             const scalar_t* delta, size_t B, size_t H, size_t N, size_t D, bool causal) {
-  constexpr int ROWS_PER_WARP = BC / NUM_WARPS;
-  constexpr int FEATURES_PER_ROW = (D_CONST + WARP_SIZE - 1) / WARP_SIZE;
-  constexpr int FEATURES_PER_THREAD = ROWS_PER_WARP * FEATURES_PER_ROW;
-  size_t tileIdx = blockIdx.x;
-  size_t BatchHeadIdx = blockIdx.y;
-  size_t BatchIdx = BatchHeadIdx / H;
-  size_t HeadIdx = BatchHeadIdx % H;
-  size_t tid = threadIdx.x;
-  size_t warp_id = tid / WARP_SIZE;
-  size_t lane_id = tid % WARP_SIZE;
-  size_t base = BatchHeadIdx * N * D_CONST;
-  size_t Tr = (N + BR - 1) / BR;
-  size_t Tc = (N + BC - 1) / BC;
-  size_t kv_start = tileIdx * BC;
-
-  const float scale = rsqrtf((float)D_CONST);
-
-  scalar_t Kj[ROWS_PER_WARP][FEATURES_PER_ROW];
-  scalar_t Vj[ROWS_PER_WARP][FEATURES_PER_ROW];
-  scalar_t dKj[ROWS_PER_WARP][FEATURES_PER_ROW];
-  scalar_t dVj[ROWS_PER_WARP][FEATURES_PER_ROW];
-
-  for (size_t r = 0; r < ROWS_PER_WARP; r++) {
-    size_t kv_row = kv_start + warp_id * ROWS_PER_WARP + r;
-
-    for (size_t f = 0; f < FEATURES_PER_ROW; f++) {
-      size_t kv_feature = f * WARP_SIZE + lane_id;
-      if (kv_feature < D_CONST && kv_row < N) {
-        Kj[r][f] = k[base + kv_row * D_CONST + kv_feature];
-        Vj[r][f] = v[base + kv_row * D_CONST + kv_feature];
-      } else {
-        Kj[r][f] = 0.0f;
-        Vj[r][f] = 0.0f;
-      }
-      dKj[r][f] = 0.0f;
-      dVj[r][f] = 0.0f;
-      
-    }
+  for (size_t d = lane_id; d < D; d += WARP_SIZE) {
+    sum += (float)O[base + d] * (float)dO[base + d];
   }
 
-  __shared__ scalar_t Qi[BR][D_CONST];
-  __shared__ scalar_t dOi[BR][D_CONST];
-  // __shared__ scalar_t dQi[BR][D_CONST];
-  __shared__ scalar_t Li[BR];
-  __shared__ scalar_t Di[BR];
-
-  size_t BR_ROWS_PER_WARP = BR / NUM_WARPS;
-  for (size_t i = 0; i < Tr; i++) {
-    for (size_t r = 0; r < BR_ROWS_PER_WARP; r++) {
-      size_t shared_row = warp_id * BR_ROWS_PER_WARP + r;
-      size_t global_row = i * BR + warp_id * BR_ROWS_PER_WARP + r;
-
-      if (lane_id == 0) {
-        if (global_row < N) {
-          Li[shared_row] = lse[BatchHeadIdx * N + global_row];
-          Di[shared_row] = delta[BatchHeadIdx * N + global_row];
-        } else {
-          Li[shared_row] = 0.0f;
-          Di[shared_row] = 0.0f;
-        }
-      }
-
-      for (size_t f = 0; f < FEATURES_PER_ROW; f++) {
-        size_t feature = f * WARP_SIZE + lane_id;
-
-        if (global_row < N && feature < D_CONST) {
-          Qi[shared_row][feature] = q[base + global_row * D_CONST + feature];
-          dOi[shared_row][feature] = dO[base + global_row * D_CONST + feature];
-          // dQi[shared_row][feature] = dq[base + global_row * D_CONST + feature];
-        } else {
-          Qi[shared_row][feature] = 0.0f;
-          dOi[shared_row][feature] = 0.0f;
-          // dQi[shared_row][feature] = 0.0f;
-        }
-      }
-    }
-    __syncthreads();
-
-    for (int r = 0; r < ROWS_PER_WARP; r++) {
-      size_t kv_row = kv_start + warp_id * ROWS_PER_WARP + r;
-
-      if (kv_row >= N) continue;
-
-      for (int qr = 0; qr < BR; qr++) {
-        size_t query_row = i * BR + qr;
-
-        if (query_row >= N) continue;
-        if (causal && kv_row > query_row) continue;
-
-        float score_partial = 0.0f;
-        float dp_partial = 0.0f;
-
-        for (size_t f = 0; f < FEATURES_PER_ROW; f++) {
-          size_t feature = f * WARP_SIZE + lane_id;
-
-          if (feature >= D_CONST) break;
-          score_partial += Qi[qr][feature] * Kj[r][f];
-          dp_partial += dOi[qr][feature] * Vj[r][f];
-        }
-
-        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-          score_partial += __shfl_down_sync(0xffffffff, score_partial, offset);
-          dp_partial += __shfl_down_sync(0xffffffff, dp_partial, offset);
-        }
-
-        float score = __shfl_sync(0xffffffff, score_partial, 0) * scale;
-        float dp = __shfl_sync(0xffffffff, dp_partial, 0);
-
-        float p = expf(score - Li[qr]);
-        float ds = p * (dp - Di[qr]);
-
-        for (int f = 0; f < FEATURES_PER_ROW; f++) {
-          int feature = f * WARP_SIZE + lane_id;
-
-          if (feature < D_CONST) {
-            float q_val = Qi[qr][feature];
-            float do_val = dOi[qr][feature];
-
-            dKj[r][f] += ds * q_val * scale;
-            dVj[r][f] += p * do_val;
-
-            size_t dq_idx = base + query_row * D_CONST + feature;
-
-            atomicAdd(&dq[dq_idx], ds * Kj[r][f] * scale);
-          }
-        }
-      }
-    }
-
-    __syncthreads();
+  for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+    sum += __shfl_down_sync(0xffffffffu, sum, offset);
   }
 
-  for (int r = 0; r < ROWS_PER_WARP; r++) {
-    size_t kv_row = kv_start + warp_id * ROWS_PER_WARP + r;
-
-    if (kv_row >= N) continue;
-
-    for (int f = 0; f < FEATURES_PER_ROW; f++) {
-      int feature = f * WARP_SIZE + lane_id;
-
-      if (feature < D_CONST) {
-        size_t idx = base + kv_row * D_CONST + feature;
-
-        dk[idx] = dKj[r][f];
-        dv[idx] = dVj[r][f];
-      }
-    }
+  if (lane_id == 0) {
+    Dout[batch_head * N + row] = (scalar_t)sum;
   }
-}
-
-
-void FlashAttentionBackward_Baseline(const CudaArray& q, const CudaArray& k, const CudaArray& v, const CudaArray& o,
-                            const CudaArray& lse, const CudaArray& dO, CudaArray* dq, CudaArray* dk, CudaArray* dv,
-                            uint32_t B, uint32_t H, uint32_t N, uint32_t D, bool causal) {
-  dim3 grid((N + BC - 1) / BC, B * H);
-  dim3 block(NUM_THREADS);
-  
-  CudaArray delta((size_t)B * H * N);
-  InitDeltaMatrixKernel<<<grid, block>>>(dO.ptr, o.ptr, delta.ptr, B, H, N, D);
-  
-  cudaMemset(dq->ptr, 0, (size_t)B * H * N * D_CONST * sizeof(scalar_t));
-  FlashAttentionBackwardKernal<<<grid, block>>>(q.ptr, k.ptr, v.ptr, o.ptr, lse.ptr,
-                                                dO.ptr, dq->ptr, dk->ptr, dv->ptr,
-                                                delta.ptr, B, H, N, D, causal);
-  cudaDeviceSynchronize();
 }
 
 template <int FBR, int FBC, int FTHREADS>
@@ -1698,8 +1358,8 @@ void FlashAttentionBackward_MatMul(
     throw std::runtime_error("FA2 tiled backward requires D=64");
   }
 
-  dim3 delta_grid((N + BC - 1) / BC, B * H);
-  dim3 delta_block(NUM_THREADS);
+  dim3 delta_grid((N + DELTA_WARPS - 1) / DELTA_WARPS, B * H);
+  dim3 delta_block(DELTA_THREADS);
   CudaArray delta((size_t)B * H * N);
 
   InitDeltaMatrixKernel<<<delta_grid, delta_block>>>(
@@ -1839,11 +1499,4 @@ PYBIND11_MODULE(ndarray_backend_cuda, m) {
       py::arg("tn") = 4,
       py::arg("num_threads") = 128,
       py::arg("use_fma") = false);
-
-  // Original baseline implementations
-  m.def("flash_attention_forward_baseline",
-        FlashAttentionForward_Baseline);
-  m.def("flash_attention_backward_baseline",
-        FlashAttentionBackward_Baseline);
-
 }
